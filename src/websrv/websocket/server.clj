@@ -1,0 +1,210 @@
+(ns websrv.websocket.server
+  "Adapter for the Jetty 9 server, with websocket support.
+  Derived from ring.adapter.jetty"
+  (:import [org.eclipse.jetty.server
+            Server Request ServerConnector
+            HttpConfiguration HttpConnectionFactory
+            ConnectionFactory SecureRequestCustomizer
+            ProxyConnectionFactory]
+           [org.eclipse.jetty.servlet ServletContextHandler ServletHandler]
+           [org.eclipse.jetty.util.thread
+            QueuedThreadPool ScheduledExecutorScheduler ThreadPool]
+           [org.eclipse.jetty.websocket.server.config JettyWebSocketServletContainerInitializer]
+           [javax.servlet.http HttpServletRequest HttpServletResponse]
+           [javax.servlet AsyncContext]
+           [org.eclipse.jetty.http2.server HTTP2CServerConnectionFactory])
+  (:require [ring.util.servlet :as servlet]
+            [websrv.websocket.utils :refer [RequestMapDecoder build-request-map]]
+            [websrv.websocket.ws :as ws]))
+
+(def send! ws/send!)
+(def ping! ws/ping!)
+(def close! ws/close!)
+(def remote-addr ws/remote-addr)
+(def idle-timeout! ws/idle-timeout!)
+(def connected? ws/connected?)
+(def req-of ws/req-of)
+(def ws-upgrade-request? ws/ws-upgrade-request?)
+(def ws-upgrade-response ws/ws-upgrade-response)
+
+(extend-protocol RequestMapDecoder
+  HttpServletRequest
+  (build-request-map [request]
+    (servlet/build-request-map request)))
+
+(defn normalize-response
+  "Normalize response for ring spec"
+  [response]
+  (cond
+    (string? response) {:body response}
+    :else response))
+
+(defn- websocket-upgrade-response?
+  [{:keys [status ws]}]
+  ;; NOTE: we know that when :ws attr is provided in the response, we
+  ;; need to upgrade to websockets protocol.
+  (and (= 101 status) ws))
+
+(defn ^:internal wrap-proxy-handler
+  "Wraps a Jetty handler in a ServletContextHandler.
+
+   Websocket upgrades require a servlet context which makes it
+   necessary to wrap the handler in a servlet context handler."
+  [jetty-handler]
+  (doto (ServletContextHandler.)
+    ;; avoid warnings
+    #_(.setContextPath "/*")
+    (.setAllowNullPathInfo true)
+    (JettyWebSocketServletContainerInitializer/configure nil)
+    (.setServletHandler jetty-handler)))
+
+(defn ^:internal proxy-handler
+  "Returns an Jetty Handler implementation for the given Ring handler."
+  [handler]
+  (wrap-proxy-handler
+   (proxy [ServletHandler] []
+     (doHandle [_ ^Request base-request ^HttpServletRequest request ^HttpServletResponse response]
+       (try
+         (let [request-map (build-request-map request)
+               response-map (-> (handler request-map)
+                                normalize-response)]
+           (when response-map
+             (if (websocket-upgrade-response? response-map)
+               (ws/upgrade-websocket request response (:ws response-map) {})
+               (servlet/update-servlet-response response response-map))))
+         (catch Throwable e
+           (.sendError response 500 (.getMessage e)))
+         (finally
+           (.setHandled base-request true)))))))
+
+(defn ^:internal proxy-async-handler
+  "Returns an Jetty Handler implementation for the given Ring **async** handler."
+  [handler]
+  (wrap-proxy-handler
+   (proxy [ServletHandler] []
+     (doHandle [_ ^Request base-request ^HttpServletRequest request ^HttpServletResponse response]
+       (try
+         (let [^AsyncContext context (.startAsync request)]
+           (handler
+            (servlet/build-request-map request)
+            (fn [response-map]
+              (let [response-map (normalize-response response-map)]
+                (if (websocket-upgrade-response? response-map)
+                  (ws/upgrade-websocket request response context (:ws response-map) {})
+                  (servlet/update-servlet-response response context response-map))))
+            (fn [^Throwable exception]
+              (.sendError response 500 (.getMessage exception))
+              (.complete context))))
+         (finally
+           (.setHandled base-request true)))))))
+
+(defn- http-config
+  "Creates jetty http configurator"
+  [{:as _
+    :keys [output-buffer-size request-header-size
+           response-header-size send-server-version? send-date-header?
+           header-cache-size sni-required? sni-host-check?]
+    :or {output-buffer-size 32768
+         request-header-size 8192
+         response-header-size 8192
+         send-server-version? true
+         send-date-header? false
+         header-cache-size 512
+         sni-required? false
+         sni-host-check? true}}]
+  (let [secure-customizer (doto (SecureRequestCustomizer.)
+                            (.setSniRequired sni-required?)
+                            (.setSniHostCheck sni-host-check?))]
+    (doto (HttpConfiguration.)
+      (.setOutputBufferSize output-buffer-size)
+      (.setRequestHeaderSize request-header-size)
+      (.setResponseHeaderSize response-header-size)
+      (.setSendServerVersion send-server-version?)
+      (.setSendDateHeader send-date-header?)
+      (.setHeaderCacheSize header-cache-size)
+      (.addCustomizer secure-customizer))))
+
+(defn- http-connector [server http-configuration h2c? port host max-idle-time proxy?]
+  (let [plain-connection-factories (cond-> [(HttpConnectionFactory. http-configuration)]
+                                     h2c? (concat [(HTTP2CServerConnectionFactory. http-configuration)])
+                                     proxy? (concat [(ProxyConnectionFactory.)]))]
+    (doto (ServerConnector.
+           ^Server server
+           ^"[Lorg.eclipse.jetty.server.ConnectionFactory;"
+           (into-array ConnectionFactory plain-connection-factories))
+      (.setPort port)
+      (.setHost host)
+      (.setIdleTimeout max-idle-time))))
+
+(defn- create-server
+  "Construct a Jetty Server instance."
+  [{:as options
+    :keys [port max-threads min-threads threadpool-idle-timeout job-queue
+           daemon? max-idle-time host h2c? http? proxy?
+           thread-pool]
+    :or {port 80
+         max-threads 50
+         min-threads 8
+         threadpool-idle-timeout 60000
+         job-queue nil
+         daemon? false
+         max-idle-time 200000
+         http? true
+         proxy? false}}]
+  (let [pool (or thread-pool
+                 (doto (QueuedThreadPool. (int max-threads)
+                                          (int min-threads)
+                                          (int threadpool-idle-timeout)
+                                          job-queue)
+                   (.setDaemon daemon?)))
+        server (doto (Server. ^ThreadPool pool)
+                 (.addBean (ScheduledExecutorScheduler.)))
+        http-configuration (http-config options)
+        connectors (cond-> []
+                     http? (conj (http-connector server http-configuration h2c? port host max-idle-time proxy?)))]
+    (.setConnectors server (into-array connectors))
+    server))
+
+(defn ^Server run-jetty
+  "
+  Start a Jetty webserver to serve the given handler according to the
+  supplied options:
+  :http? - allow connections over HTTP
+  :port - the port to listen on (defaults to 80)
+  :host - the hostname to listen on
+  :async? - using Ring 1.6 async handler?
+  :join? - blocks the thread until server ends (defaults to true)
+  :daemon? - use daemon threads (defaults to false)
+  :thread-pool - the thread pool for Jetty workload
+  :max-threads - the maximum number of threads to use (default 50), ignored if `:thread-pool` provided
+  :min-threads - the minimum number of threads to use (default 8), ignored if `:thread-pool` provided
+  :threadpool-idle-timeout - the maximum idle time in milliseconds for a thread (default 60000), ignored if `:thread-pool` provided
+  :job-queue - the job queue to be used by the Jetty threadpool (default is unbounded), ignored if `:thread-pool` provided
+  :max-idle-time  - the maximum idle time in milliseconds for a connection (default 200000)
+  :ws-max-idle-time  - the maximum idle time in milliseconds for a websocket connection (default 500000)
+  :ws-max-text-message-size  - the maximum text message size in bytes for a websocket connection (default 65536)
+  :h2c? - enable http2 clear text on plain socket port
+  :proxy? - enable the proxy protocol on plain socket port (see http://www.eclipse.org/jetty/documentation/9.4.x/configuring-connectors.html#_proxy_protocol)
+  :wrap-jetty-handler - a wrapper fn that wraps default jetty handler into another, default to `identity`, not that it's not a ring middleware
+  :sni-required? - require sni for secure connection, default to false
+  :sni-host-check? - enable host check for secure connection, default to true
+  "
+  [handler {:as options
+            :keys [configurator join? async?
+                   allow-null-path-info wrap-jetty-handler]
+            :or {allow-null-path-info false
+                 join? true
+                 wrap-jetty-handler identity}}]
+  (let [^Server s (create-server options)
+        ring-app-handler (wrap-jetty-handler
+                          (if async? (proxy-async-handler handler) (proxy-handler handler)))]
+    (.setHandler s ring-app-handler)
+    (when-let [c configurator]
+      (c s))
+    (.start s)
+    (when join?
+      (.join s))
+    s))
+
+(defn stop-server [^Server s]
+  (.stop s))
